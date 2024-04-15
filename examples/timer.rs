@@ -1,9 +1,13 @@
-//! Minimal example of the runtime having multiple timers "run at once"
+//! Minimal example of the runtime having multiple timers "run at once" on a single thread.  Each
+//! timer sleeps for 1 second, but as the final print statement shows, the total runtime of the
+//! system is also about 1 second, meaning that the timers logically ran concurrently.
+//!
+//! This is also a good minimal example of the old "concurrency != parallelism" adage.
 
 use std::time::{Duration, Instant};
 
 fn main() {
-    let mut runtime = lilfuture::runtime::Runtime::new();
+    let runtime = lilfuture::executor::Executor::new();
 
     runtime.spawn(async {
         println!("starting timer 1");

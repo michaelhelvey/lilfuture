@@ -1,9 +1,9 @@
 use rustix::event::kqueue;
 use rustix::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use rustix::io::Errno;
-use std::io;
 use std::mem::MaybeUninit;
 use std::time::Duration;
+use std::{io, mem};
 
 /// Registers a changelist of events with kqueue.
 ///
@@ -27,14 +27,11 @@ unsafe fn register_events<const N: usize>(
     let el_ref = &mut *eventlist.as_mut_ptr();
 
     // Safety: the invariants of this function are followed in the following ways: it's not a real
-    // vec, we never push, pop, or otherwise mutate it, we also mem::forget it immediately so that
-    // its Drop implementation is never invoked.
-    let mut eventlist_vec = Vec::from_raw_parts(el_ref.as_mut_ptr(), N, N);
-
+    // vec, we never push, pop, or otherwise mutate it, we also wrap it in `ManuallyDrop` so that
+    // its Drop implementation is never invoked (and thus it doesn't try to free() the pointer to
+    // the MaybeUninit on the stack).
+    let mut eventlist_vec = mem::ManuallyDrop::new(Vec::from_raw_parts(el_ref.as_mut_ptr(), N, N));
     kqueue::kevent(queue, changelist, &mut eventlist_vec, timeout)?;
-    // Forget the eventlist_vec immediately so that we don't accidentally try to free() stack
-    // memory.
-    std::mem::forget(eventlist_vec);
 
     // We can now safely assume it's initialized because the syscall to kevent() completed:
     let eventlist = eventlist.assume_init();
@@ -109,14 +106,14 @@ pub struct Poller {
 
 impl Poller {
     /// Creates a new poller with an underlying kqueue
-    pub fn new() -> io::Result<Self> {
+    pub(crate) fn new() -> io::Result<Self> {
         let queue = kqueue::kqueue()?;
 
         Ok(Self { queue })
     }
 
     /// Registers interest in a TimerEvent that takes place after TimerEvent#duration.
-    pub fn register_timer(&self, event: TimerEvent) -> io::Result<()> {
+    pub(crate) fn register_timer(&self, event: TimerEvent) -> io::Result<()> {
         let enabled_flags = if event.enabled {
             kqueue::EventFlags::ADD
         } else {
@@ -144,9 +141,9 @@ impl Poller {
 
     /// Registers interest in events descripted by `Event` in the given file descriptor referrred to
     /// by `file`.
-    pub fn register_file_descriptor(
+    pub(crate) fn register_socket(
         &self,
-        file: BorrowedFd<'_>,
+        socket: BorrowedFd<'_>,
         event: SocketEvent,
     ) -> io::Result<()> {
         let read_flags = if event.readable {
@@ -166,14 +163,14 @@ impl Poller {
 
         let changelist = [
             kqueue::Event::new(
-                kqueue::EventFilter::Read(file.as_raw_fd()),
+                kqueue::EventFilter::Read(socket.as_raw_fd()),
                 common_file_flags | read_flags,
                 // safety: I'm not sure why rustix wants an isize here, but the kqueue API wants an
                 // uintptr_t, at least on my system, which is quite adequately represented by a `usize`
                 event.key as _,
             ),
             kqueue::Event::new(
-                kqueue::EventFilter::Write(file.as_raw_fd()),
+                kqueue::EventFilter::Write(socket.as_raw_fd()),
                 common_file_flags | write_flags,
                 event.key as _,
             ),
@@ -190,7 +187,7 @@ impl Poller {
 
     /// Blocks until at least one of the previously registered events becomes available.  Places
     /// found events into the `events` struct which can then be iterated over using `events.iter()`.
-    pub fn wait(&self, events: &mut Events) -> io::Result<()> {
+    pub(crate) fn wait(&self, events: &mut Events) -> io::Result<()> {
         unsafe { kqueue::kevent(&self.queue, &[], &mut events.eventlist, None)? };
 
         Ok(())
@@ -200,7 +197,7 @@ impl Poller {
 /// Represents an event that we can register our interest in with a `Poller`.  A light wrapper
 /// around `kqueue::Event`.
 #[derive(Debug)]
-pub enum Event {
+pub(crate) enum Event {
     Socket(SocketEvent),
     Timer(TimerEvent),
 }
@@ -215,18 +212,18 @@ impl Event {
 }
 
 #[derive(Debug)]
-pub struct TimerEvent {
+pub(crate) struct TimerEvent {
     /// The identifying key that the client can use to identify the timer
-    pub key: usize,
+    pub(crate) key: usize,
     /// Whether or not the timer is enabled.  The client can cancel a timer by re-registering a
     /// TimerEvent with this flag off.
-    pub enabled: bool,
+    pub(crate) enabled: bool,
     /// The duration that should pass before the timer event is triggered.
-    pub duration: Option<Duration>,
+    pub(crate) duration: Option<Duration>,
 }
 
 impl TimerEvent {
-    pub fn from_parts(key: usize, duration: Option<Duration>, enabled: bool) -> Self {
+    fn from_parts(key: usize, duration: Option<Duration>, enabled: bool) -> Self {
         Self {
             key,
             duration,
@@ -234,20 +231,20 @@ impl TimerEvent {
         }
     }
 
-    pub fn new(key: usize, duration: Duration) -> Self {
+    pub(crate) fn new(key: usize, duration: Duration) -> Self {
         Self::from_parts(key, Some(duration), true)
     }
 }
 
 #[derive(Debug)]
-pub struct SocketEvent {
-    pub key: usize,
-    pub readable: bool,
-    pub writable: bool,
+pub(crate) struct SocketEvent {
+    pub(crate) key: usize,
+    pub(crate) readable: bool,
+    pub(crate) writable: bool,
 }
 
 impl SocketEvent {
-    pub fn new(key: usize, readable: bool, writable: bool) -> Self {
+    pub(crate) fn new(key: usize, readable: bool, writable: bool) -> Self {
         Self {
             key,
             readable,
@@ -255,19 +252,19 @@ impl SocketEvent {
         }
     }
 
-    pub fn readable(key: usize) -> Self {
+    pub(crate) fn readable(key: usize) -> Self {
         Self::new(key, true, false)
     }
 
-    pub fn writable(key: usize) -> Self {
+    pub(crate) fn writable(key: usize) -> Self {
         Self::new(key, false, true)
     }
 
-    pub fn all(key: usize) -> Self {
+    pub(crate) fn all(key: usize) -> Self {
         Self::new(key, true, true)
     }
 
-    pub fn none(key: usize) -> Self {
+    pub(crate) fn none(key: usize) -> Self {
         Self::new(key, false, false)
     }
 }
@@ -275,7 +272,7 @@ impl SocketEvent {
 /// An iterator over events received from a Poller that receives the `kqueue::Event` structs from
 /// the underlying `kevent()` syscall and transforms them into the `Poller`'s custom `Event` enum
 /// for consumption by client-facing code.
-pub struct Events {
+pub(crate) struct Events {
     eventlist: Vec<kqueue::Event>,
 }
 
@@ -288,17 +285,23 @@ impl Default for Events {
 }
 
 impl Events {
-    pub fn new() -> Self {
+    /// Create a new vector of `kqueue::Event` with the default capacity that we can pass to
+    /// `Poller::wait`.
+    pub(crate) fn new() -> Self {
         Self {
             eventlist: Vec::with_capacity(DEFAULT_EVENT_CAP),
         }
     }
 
-    pub fn clear(&mut self) {
+    /// Clears all the events since the last call to `Poller::wait` to prepare the structure for a
+    /// new `Poller::wait` invocation on the next tick of the loop.
+    pub(crate) fn clear(&mut self) {
         self.eventlist.clear();
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = Event> + '_ {
+    /// Iterate over all of the instances of `kqueue::Event` that we hold, transforming them into
+    /// our more friendly top-level `Event` type.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = Event> + '_ {
         self.eventlist.iter().map(|x| {
             if let kqueue::EventFilter::Timer { ident, timer } = x.filter() {
                 return Event::Timer(TimerEvent::from_parts(ident as _, timer, true));
@@ -335,7 +338,7 @@ mod tests {
 
         // Register that we want to know when that listener is readable:
         poller
-            .register_file_descriptor(listener.as_fd(), SocketEvent::readable(1234))
+            .register_socket(listener.as_fd(), SocketEvent::readable(1234))
             .unwrap();
 
         let mut events = Events::new();

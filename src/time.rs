@@ -6,6 +6,7 @@ use std::{
 
 use crate::{poll::TimerEvent, reactor};
 
+/// Future returned by [`sleep`](sleep).
 pub struct TimerFuture {
     deadline: Instant,
     event_key: Option<usize>,
@@ -47,8 +48,12 @@ impl Future for TimerFuture {
     }
 }
 
+/// Puts the current task to sleep for at least the specified `Duration`.  Note that waking up the
+/// task after this duration has elapsed is done on a best effort basis: if some other task is
+/// greedily blocking the thread then this future will not be polled again until after that other
+/// task relinquishes its hold on the thread.
 pub fn sleep(duration: Duration) -> TimerFuture {
-    // Check if the duration is represntable with an `Instant` and if not replace it with some
+    // Check if the duration is representable with an `Instant` and if not replace it with some
     // ridiculously long time
     match Instant::now().checked_add(duration) {
         Some(deadline) => TimerFuture {
