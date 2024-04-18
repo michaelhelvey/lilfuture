@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    marker::PhantomPinned,
     task::Poll,
     time::{Duration, Instant},
 };
@@ -10,13 +11,16 @@ use crate::{poll::TimerEvent, reactor};
 pub struct TimerFuture {
     deadline: Instant,
     event_key: Option<usize>,
+    // We need to be !Unpin because if we moved while registered with the reactor we could wreak
+    // havoc on any executor that did not Pin<Box> us.
+    // _pin: PhantomPinned,
 }
 
 impl Future for TimerFuture {
     type Output = ();
 
     fn poll(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         if Instant::now() >= self.deadline {
@@ -31,10 +35,23 @@ impl Future for TimerFuture {
             // Register an event with the global reactor that says "wake me up when this timer
             // fires"
             reactor::REACTOR.with_borrow_mut(|r| {
-                let duration_until_deadline = self.deadline - Instant::now();
+                // Safety: we do not move out of the &mut Self that we get back from
+                // `get_unchecked_mut` here, we merely fetch/set a duration & and an event_key out
+                // of it, which are both `Copy` and do not depend in any way on the address of
+                // `Self`
+                let (duration_until_deadline, key) = unsafe {
+                    let this = self.get_unchecked_mut();
 
-                let key = r.next_key();
-                self.event_key = Some(key);
+                    let duration_until_deadline = this.deadline - Instant::now();
+
+                    let key = this.event_key.unwrap_or_else(|| {
+                        let key = r.next_key();
+                        this.event_key = Some(key);
+                        key
+                    });
+
+                    (duration_until_deadline, key)
+                };
 
                 r.register_timer(
                     cx.waker().clone(),
@@ -59,6 +76,7 @@ pub fn sleep(duration: Duration) -> TimerFuture {
         Some(deadline) => TimerFuture {
             deadline,
             event_key: None,
+            // _pin: PhantomPinned,
         },
         // 30 years
         None => TimerFuture {
@@ -66,6 +84,7 @@ pub fn sleep(duration: Duration) -> TimerFuture {
                 .checked_add(Duration::from_secs(36400 + 365 + 30))
                 .unwrap(),
             event_key: None,
+            // _pin: PhantomPinned,
         },
     }
 }
