@@ -10,7 +10,6 @@ use std::future::Future;
 use std::io;
 use std::io::Read;
 use std::io::Write;
-use std::marker::PhantomPinned;
 use std::net;
 use std::pin::Pin;
 use std::task::Context;
@@ -45,8 +44,6 @@ impl TcpListener {
         TcpListenerAcceptFuture {
             listener: &self.0,
             event_key: None,
-
-            _pin: PhantomPinned,
         }
     }
 }
@@ -56,40 +53,29 @@ impl TcpListener {
 pub struct TcpListenerAcceptFuture<'a> {
     listener: &'a net::TcpListener,
     event_key: Option<usize>,
-
-    // As with any future that registers itself with the reactor, we need to force ourselves to be
-    // !Unpin
-    _pin: PhantomPinned,
 }
 
 impl<'a> Future for TcpListenerAcceptFuture<'a> {
     type Output = io::Result<(TcpStream, net::SocketAddr)>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.listener.accept() {
             // If waiting for a connection would block, schedule ourselves with the reactor and then
             // return pending:
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 reactor::REACTOR.with_borrow_mut(|r| {
-                    let (key, listener) = unsafe {
-                        let this = self.get_unchecked_mut();
-                        // Either retrieve the key from ourselves if we've registered ourselves
-                        // before, or else get a new unique key from the reactor.
-                        let key = this.event_key.unwrap_or_else(|| {
-                            let next_key = r.next_key();
-                            this.event_key = Some(next_key);
-                            next_key
-                        });
-
-                        (key, this.listener)
-                    };
+                    let key = self.event_key.unwrap_or_else(|| {
+                        let next_key = r.next_key();
+                        self.event_key = Some(next_key);
+                        next_key
+                    });
 
                     // Every time we get a WouldBlock, we need to re-register ourselves, because the
                     // ONESHOT event mode will automatically de-register the event on each poll
                     // unless we re-register interest.
                     r.register_socket(
                         cx.waker().clone(),
-                        listener.as_fd(),
+                        self.listener.as_fd(),
                         SocketEvent::readable(key),
                     )
                     .expect("could not register readable event with async i/o system");
@@ -108,8 +94,6 @@ impl<'a> Future for TcpListenerAcceptFuture<'a> {
 pub struct TcpStream {
     inner: net::TcpStream,
     event_key: Option<usize>,
-
-    _pin: PhantomPinned,
 }
 
 impl TcpStream {
@@ -119,8 +103,6 @@ impl TcpStream {
         Ok(Self {
             inner: stream,
             event_key: None,
-
-            _pin: PhantomPinned,
         })
     }
 }
@@ -139,32 +121,22 @@ impl TcpStream {
 
 impl AsyncRead for TcpStream {
     fn poll_read(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        let (mut inner, key) = unsafe {
-            let this = self.get_unchecked_mut();
-
-            // This is our one chance to get any values out of self if we need to,
-            // so we allocate our key now even if end up not using it.
-            let key = reactor::REACTOR.with_borrow_mut(|r| {
-                this.event_key.unwrap_or_else(|| {
-                    let key = r.next_key();
-                    this.event_key = Some(key);
-                    key
-                })
-            });
-
-            (Pin::new_unchecked(&mut this.inner), key)
-        };
-
-        match inner.read(buf) {
+        match self.inner.read(buf) {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 reactor::REACTOR.with_borrow_mut(|r| {
+                    let key = self.event_key.unwrap_or_else(|| {
+                        let key = r.next_key();
+                        self.event_key = Some(key);
+                        key
+                    });
+
                     r.register_socket(
                         cx.waker().clone(),
-                        inner.as_fd(),
+                        self.inner.as_fd(),
                         SocketEvent::readable(key),
                     )
                     .expect("unable to register socket with async/io system");
@@ -179,27 +151,23 @@ impl AsyncRead for TcpStream {
 }
 
 impl AsyncWrite for TcpStream {
-    fn poll_write(self: Pin<&mut Self>, cx: Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        let (mut inner, key) = unsafe {
-            let this = self.get_unchecked_mut();
-
-            let key = reactor::REACTOR.with_borrow_mut(|r| {
-                this.event_key.unwrap_or_else(|| {
-                    let key = r.next_key();
-                    this.event_key = Some(key);
-                    key
-                })
-            });
-
-            (Pin::new_unchecked(&mut this.inner), key)
-        };
-
-        match inner.write(buf) {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.inner.write(buf) {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 reactor::REACTOR.with_borrow_mut(|r| {
+                    let key = self.event_key.unwrap_or_else(|| {
+                        let key = r.next_key();
+                        self.event_key = Some(key);
+                        key
+                    });
+
                     r.register_socket(
                         cx.waker().clone(),
-                        inner.as_fd(),
+                        self.inner.as_fd(),
                         SocketEvent::writable(key),
                     )
                     .expect("unable to register socket with async/io system");
@@ -212,27 +180,19 @@ impl AsyncWrite for TcpStream {
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: Context<'_>) -> Poll<io::Result<()>> {
-        let (mut inner, key) = unsafe {
-            let this = self.get_unchecked_mut();
-
-            let key = reactor::REACTOR.with_borrow_mut(|r| {
-                this.event_key.unwrap_or_else(|| {
-                    let key = r.next_key();
-                    this.event_key = Some(key);
-                    key
-                })
-            });
-
-            (Pin::new_unchecked(&mut this.inner), key)
-        };
-
-        match inner.flush() {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: Context<'_>) -> Poll<io::Result<()>> {
+        match self.inner.flush() {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 reactor::REACTOR.with_borrow_mut(|r| {
+                    let key = self.event_key.unwrap_or_else(|| {
+                        let key = r.next_key();
+                        self.event_key = Some(key);
+                        key
+                    });
+
                     r.register_socket(
                         cx.waker().clone(),
-                        inner.as_fd(),
+                        self.inner.as_fd(),
                         SocketEvent::writable(key),
                     )
                     .expect("unable to register socket with async/io system");
