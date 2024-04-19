@@ -114,10 +114,10 @@ impl TcpStream {
 // represented as a file descriptor.
 //
 // There's also a lot of duplication going on between each method as each one basically does the
-// same thing: get a reference to the inner source & the key that we should use to register interest
-// in more events, and then proxies to the underlying read/write/flush on the io::Read or Write,
-// and then if it would block we register ourself with the reactor and return Pending, or else
-// return Ready with the result of the underlying operation.
+// same thing: get a reference to the inner source & the key that we should use to register
+// interest in more events, and then proxies to the underlying read/write/flush on the io::Read or
+// Write, and then if it would block we register ourself with the reactor and return Pending, or
+// else return Ready with the result of the underlying operation.
 
 impl AsyncRead for TcpStream {
     fn poll_read(
