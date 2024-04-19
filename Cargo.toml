@@ -7,8 +7,3 @@ version = "0.1.0"
 
 [dependencies]
 rustix = { version = "0.38.32", features = ["event"] }
-tracing = "0.1.40"
-
-[dev-dependencies]
-tracing-error = "0.2.0"
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

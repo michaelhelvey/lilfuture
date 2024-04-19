@@ -1,5 +1,5 @@
-use lilfuture::AsyncReadExt;
 use lilfuture::{executor::Executor, net::TcpListener};
+use lilfuture::{AsyncBufReadExt, AsyncBufferedReader};
 
 thread_local! {
     // Since we want to be able to spawn tasks from inside our accept handler, we need a runtime
@@ -14,11 +14,22 @@ async fn server_loop(listener: TcpListener) {
 
         RUNTIME.with(|exe| {
             exe.spawn(async move {
-                let mut buf = Vec::new();
-                stream.read_to_end(&mut buf).await.unwrap();
-                let message = String::from_utf8(buf).unwrap();
-
-                println!("Received message from client: {:?}", message);
+                let mut buf_reader = AsyncBufferedReader::new(&mut stream);
+                loop {
+                    let mut buf = Vec::with_capacity(4096);
+                    match buf_reader.read_until(&mut buf, b'\n').await {
+                        Ok(_) => {
+                            let message = String::from_utf8(buf).unwrap();
+                            println!("Received message from client ({}): {:?}", addr, message);
+                        }
+                        Err(err) => {
+                            println!(
+                                "encountered error reading from client {addr}, breaking: {err:?}"
+                            );
+                            break;
+                        }
+                    };
+                }
             });
         });
     }

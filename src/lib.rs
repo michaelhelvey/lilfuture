@@ -27,6 +27,18 @@ pub trait AsyncRead {
     ) -> Poll<io::Result<usize>>;
 }
 
+/// A corollary to io::BufRead, which represents an `AsyncRead` backed by an internal buffer for
+/// the efficient implementation of things like `read_until` or `read_line`.
+pub trait AsyncBufRead {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>>;
+
+    fn consume(self: Pin<&mut Self>, amount: usize);
+}
+
+pub trait AsyncBufReadExt: AsyncBufRead + Unpin {
+    fn read_until<'a>(&'a mut self, buf: &'a mut Vec<u8>, delim: u8) -> ReadUntil<'a, Self>;
+}
+
 /// Writes bytes asynchronously
 pub trait AsyncWrite {
     /// Attempt to write bytes from `buf` into the underlying I/O connection.
@@ -127,5 +139,211 @@ where
         // Pin::new(*reader) here, when I'm calling a new function, but I can't create a new
         // loop and poll it inline here using the same method
         read_to_end_internal(buffer, Pin::new(*reader), cx)
+    }
+}
+
+/// Implmenets AsyncBufRead for any AsyncRead
+pub struct AsyncBufferedReader<'a, R: AsyncRead + Unpin + ?Sized> {
+    // Owned buffer of bytes to buffer the reader.
+    buffer: Box<[u8; 1024]>,
+
+    // Pointer into `buffer` specifying where the consumer has consumed up to
+    consumed: usize,
+
+    // Pointer into `buffer` specifying where we have read up to.  This is a bit different than
+    // buffer.len() as that would always point to the maximum amount of the buffer we have
+    // ever used
+    len: usize,
+
+    // Underlying AsyncRead that we can use to fill the buffer
+    reader: &'a mut R,
+}
+
+impl<'a, R> AsyncBufferedReader<'a, R>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    pub fn new(reader: &'a mut R) -> Self {
+        Self {
+            // should probably make this configurable...
+            buffer: Box::new([0; 1024]),
+            consumed: 0,
+            len: 0,
+            reader,
+        }
+    }
+}
+
+// Attempt to fill a buf using
+fn fill_buf_internal<R: AsyncRead + Unpin + ?Sized>(
+    buf: &mut [u8],
+    mut reader: Pin<&mut R>,
+    cx: &mut Context<'_>,
+) -> Poll<io::Result<usize>> {
+    reader.as_mut().poll_read(cx, buf)
+}
+
+impl<'a, R> AsyncBufRead for AsyncBufferedReader<'a, R>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        let (buffer, cursor, len, reader) = unsafe {
+            let this = self.get_unchecked_mut();
+
+            (
+                &mut this.buffer,
+                &mut this.consumed,
+                &mut this.len,
+                &mut this.reader,
+            )
+        };
+
+        // Fill as much of our buf as we can from the current length up to the end
+        let local_buf = &mut buffer[*len..];
+
+        // Read from the buffer and return a slice starting at the current cursor position
+        match fill_buf_internal(local_buf, Pin::new(*reader), cx) {
+            Poll::Ready(Ok(0)) => Poll::Ready(Ok(&[])),
+            Poll::Ready(Ok(n)) => {
+                *len += n;
+                // Return a slice into our buffer for the consumer:
+                Poll::Ready(Ok(&buffer[*cursor..]))
+            }
+            Poll::Ready(Err(err)) => {
+                // Immediately pass on any errors to the consumer:
+                Poll::Ready(Err(err))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn consume(self: Pin<&mut Self>, amount: usize) {
+        let (buffer, cursor, len) = unsafe {
+            let this = self.get_unchecked_mut();
+
+            (&mut this.buffer, &mut this.consumed, &mut this.len)
+        };
+
+        // If we are consuming everything we have, we can be a little faster here (I think?  inb4
+        // some nerd comes in here and tells me that this is actually slower because of branch
+        // prediction or some shit and I'd be better off doing a memmove of nothing down below):
+        if amount == *len {
+            *len = 0;
+            *cursor = 0;
+            return;
+        }
+
+        // Move our internal cursor up by the specified amount, and assert that it has not gone
+        // past the end of the total bytes that we have read
+        *cursor = *cursor + amount;
+        assert!(*cursor <= *len);
+
+        // The number of bytes that we have NOT consumed
+        let unconsumed_length = buffer.len() - *cursor;
+
+        // memmove: copy from cursor to len (the unconsumed bytes) back to 0.
+        // Effectively this "resets" the buffer so that buffer[0] is now the first unconsumed byte
+        buffer.copy_within(*cursor..unconsumed_length, 0);
+
+        // now we can reset cursor and len:
+        *len = *len - *cursor;
+        *cursor = 0;
+    }
+}
+
+impl<A> AsyncBufReadExt for A
+where
+    A: AsyncBufRead + Unpin,
+{
+    fn read_until<'a>(&'a mut self, buf: &'a mut Vec<u8>, delim: u8) -> ReadUntil<'a, Self> {
+        ReadUntil {
+            delim,
+            buf,
+            buf_read: self,
+            _pin: PhantomPinned,
+        }
+    }
+}
+
+pub struct ReadUntil<'a, R: AsyncBufRead + Unpin + ?Sized> {
+    // The delimeter to read until:
+    delim: u8,
+    // The buffer to collect consumed bytes into
+    buf: &'a mut Vec<u8>,
+
+    // Make this !Unpin so we can implement future safely
+    _pin: PhantomPinned,
+
+    // The underlying buffered reader to use to get bytes
+    buf_read: &'a mut R,
+}
+
+fn read_until_internal<'a, R: AsyncBufRead + Unpin>(
+    mut buf_read: Pin<&mut R>,
+    buf: &mut Vec<u8>,
+    delim: u8,
+    cx: &mut Context<'_>,
+) -> Poll<io::Result<()>> {
+    loop {
+        match buf_read.as_mut().poll_fill_buf(cx) {
+            Poll::Pending => {
+                return Poll::Pending;
+            }
+            Poll::Ready(Ok(slice)) => {
+                // I'm not sure what the right way to handle EOFs is right now, I know that this
+                // sure ain't it, but it works for the demo.
+                if slice.len() == 0 {
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof")));
+                }
+                // I'm sure there's some cool slice API for this
+                let mut i = 0;
+                while i < slice.len() {
+                    if slice[i] == delim {
+                        break;
+                    }
+                    i += 1
+                }
+
+                let mut found = true;
+                if i == slice.len() {
+                    found = true;
+                }
+
+                // `i` will either equal the index of the delimeter, or the end of the slice, so
+                // either way copy everything thing we have into the buffer:
+                buf.extend_from_slice(&slice[0..i]);
+
+                // then consume everything we copied:
+                buf_read.as_mut().consume(i + 1);
+
+                // Finally, if we found what we were looking for, return (otherwise loop):
+                if found {
+                    return Poll::Ready(Ok(()));
+                }
+            }
+            Poll::Ready(Err(err)) => {
+                return Poll::Ready(Err(err));
+            }
+        }
+    }
+}
+
+impl<'a, R: AsyncBufRead + Unpin> Future for ReadUntil<'a, R> {
+    type Output = io::Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let (buf, reader, delim) = unsafe {
+            let Self {
+                buf,
+                buf_read,
+                delim,
+                ..
+            } = self.get_unchecked_mut();
+
+            (buf, buf_read, delim)
+        };
+
+        read_until_internal(Pin::new(*reader), buf, *delim, cx)
     }
 }

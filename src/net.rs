@@ -125,6 +125,11 @@ impl AsyncRead for TcpStream {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
+        // Welp, there went an hour of my life
+        if cfg!(debug_assertions) && buf.len() == 0 {
+            panic!("Some dumbass called poll_read with an empty buffer which will return Ready(0) immediately without actually doing anything");
+        }
+
         match self.inner.read(buf) {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 reactor::REACTOR.with_borrow_mut(|r| {
