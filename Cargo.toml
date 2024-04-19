@@ -6,9 +6,4 @@ version = "0.1.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-rustix = {version = "0.38.32", features = ["event"]}
-tracing = "0.1.40"
-
-[dev-dependencies]
-tracing-error = "0.2.0"
-tracing-subscriber = {version = "0.3.18", features = ["env-filter"]}
+rustix = { version = "0.38.32", features = ["event"] }

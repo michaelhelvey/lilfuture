@@ -83,6 +83,7 @@ impl Reactor {
             return Ok(());
         }
 
+        self.events.clear();
         self.poller.wait(&mut self.events)?;
 
         for event in self.events.iter() {

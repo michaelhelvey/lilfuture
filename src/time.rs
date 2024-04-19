@@ -33,8 +33,11 @@ impl Future for TimerFuture {
             reactor::REACTOR.with_borrow_mut(|r| {
                 let duration_until_deadline = self.deadline - Instant::now();
 
-                let key = r.next_key();
-                self.event_key = Some(key);
+                let key = self.event_key.unwrap_or_else(|| {
+                    let key = r.next_key();
+                    self.event_key = Some(key);
+                    key
+                });
 
                 r.register_timer(
                     cx.waker().clone(),

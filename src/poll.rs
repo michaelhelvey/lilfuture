@@ -10,8 +10,8 @@ use std::{io, mem};
 /// Does some horrible things with MaybeUninit & Vec to get around the troubling fact that rustix
 /// uses a &mut Vec<T> to represent a *mut T output parameter in a C function, which imho is really
 /// sloppy, as if we actually did that it would require us to heap allocate on every event
-/// registration.  We do a little sneaky pointer manipulation to convince Rust that a stack variable
-/// is actually a Vec to get around this.
+/// registration.  We do a little sneaky pointer manipulation to convince Rust that a stack
+/// variable is actually a Vec to get around this.
 ///
 /// See: https://github.com/bytecodealliance/rustix/issues/1043
 unsafe fn register_events<const N: usize>(
@@ -258,14 +258,6 @@ impl SocketEvent {
 
     pub(crate) fn writable(key: usize) -> Self {
         Self::new(key, false, true)
-    }
-
-    pub(crate) fn all(key: usize) -> Self {
-        Self::new(key, true, true)
-    }
-
-    pub(crate) fn none(key: usize) -> Self {
-        Self::new(key, false, false)
     }
 }
 
