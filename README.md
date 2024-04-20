@@ -12,5 +12,9 @@ as:
 
 ## Getting Started
 
-At the time of writing, there is still a lot of work to do, but you can see the very basics of the
-runtime by running `cargo run --example timer` on a mac.
+There are a few basic examples of the runtime in action, which you can run via
+`cargo run --example <example>`.
+
+Note that the `io` module is very rough, and is really only intended to be good enough to get the
+echo server example working: writing a real-world async networking library was totally out of scope
+for this project.

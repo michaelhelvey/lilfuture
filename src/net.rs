@@ -17,10 +17,9 @@ use std::task::Poll;
 
 use rustix::fd::AsFd;
 
+use crate::io::{AsyncRead, AsyncWrite};
 use crate::poll::SocketEvent;
 use crate::reactor;
-use crate::AsyncRead;
-use crate::AsyncWrite;
 
 /// Async TcpListener, roughly analogous to a std::net::TcpListener, but schedules its operations on
 /// the event loop instead of blocking.
@@ -105,6 +104,12 @@ impl TcpStream {
             event_key: None,
         })
     }
+
+    /// Attempts to create a new, independently owned handle to the underlying socket.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        let inner_clone = self.inner.try_clone()?;
+        Self::from_blocking(inner_clone)
+    }
 }
 
 // == AsyncRead / AsyncWrite implementations for TcpStream ==
@@ -125,10 +130,9 @@ impl AsyncRead for TcpStream {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        // Welp, there went an hour of my life
-        if cfg!(debug_assertions) && buf.len() == 0 {
-            panic!("Some dumbass called poll_read with an empty buffer which will return Ready(0) immediately without actually doing anything");
-        }
+        // We use a read of 0 bytes to represent an EOF almost everywhere, so if we fuck up and
+        // poll with an empty buffer, we'll get a infinite loop of EOFs somewhere else
+        debug_assert!(!buf.is_empty(), "poll_read() on an empty buffer will return Ready(0) instantly which is almost certainly not what you expect");
 
         match self.inner.read(buf) {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -158,7 +162,7 @@ impl AsyncRead for TcpStream {
 impl AsyncWrite for TcpStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        cx: Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         match self.inner.write(buf) {
@@ -185,7 +189,7 @@ impl AsyncWrite for TcpStream {
         }
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.inner.flush() {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 reactor::REACTOR.with_borrow_mut(|r| {
